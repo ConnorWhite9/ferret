@@ -1,0 +1,13 @@
+spec.md
+.env
+.node_modules
+py_cache
+__pycache__/
+*.py[cod]
+data/raw/
+data/cache/
+.cache/
+.venv/
+venv/
+eval/results.json
+runs/

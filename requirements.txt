@@ -1,0 +1,11 @@
+torch>=2.0
+torchvision>=0.15
+foolbox>=3.3
+gymnasium>=0.29
+numpy
+Pillow
+tqdm
+tyro
+tensorboard
+langgraph>=0.2
+wandb>=0.16
