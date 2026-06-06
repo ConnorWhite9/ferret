@@ -33,6 +33,7 @@ class PolicyConfig:
     mlp_hidden: int = POLICY_MLP_HIDDEN
     max_budget: int = MAX_BUDGET
     num_actions: int = NUM_PROBE_ACTIONS
+    use_mlp_trunk: bool = False  # ablation: swap transformer for flat MLP
 
 
 def _to_tensor(obs: dict[str, np.ndarray | torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -77,19 +78,32 @@ class FerretPolicy(nn.Module):
         self.pert_embed = nn.Embedding(NUM_PERT_TYPES + 1, d, padding_idx=NUM_PERT_TYPES)
         self.mag_embed = nn.Embedding(NUM_MAGNITUDES + 1, d, padding_idx=NUM_MAGNITUDES)
         self.response_proj = nn.Linear(NUM_CLASSES, d)
+
+        # Learnable positional encodings for probe step order (§6.1).
+        # max_budget+1 to accommodate 1-indexed gathering.
+        self.pos_embed = nn.Embedding(self.config.max_budget + 1, d)
         self.empty_token = nn.Parameter(torch.zeros(1, 1, d))
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d,
-            nhead=self.config.nhead,
-            dim_feedforward=d * 4,
-            batch_first=True,
-            activation="gelu",
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=self.config.num_layers,
-        )
+        if not self.config.use_mlp_trunk:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d,
+                nhead=self.config.nhead,
+                dim_feedforward=d * 4,
+                batch_first=True,
+                activation="gelu",
+            )
+            self.transformer: nn.Module = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=self.config.num_layers,
+            )
+        else:
+            # Ablation: flat MLP that reads the mean-pooled sequence (no attention)
+            self.transformer = nn.Sequential(
+                nn.Linear(d, d * 2),
+                nn.GELU(),
+                nn.Linear(d * 2, d),
+                nn.GELU(),
+            )
 
         static_in = INPUT_EMBED_DIM + 1 + PREFERENCE_DIM + 1
         self.static_proj = nn.Sequential(
@@ -121,10 +135,14 @@ class FerretPolicy(nn.Module):
 
         probe_tokens = self.grid_embed(grid) + self.pert_embed(pert) + self.mag_embed(mag)
         response_tokens = self.response_proj(responses)
-        seq = probe_tokens + response_tokens
+
+        # Learnable positional encoding encodes probe step order (§6.1).
+        max_len = grid.shape[1]
+        pos_ids = torch.arange(max_len, device=grid.device).unsqueeze(0)  # [1, T]
+        pos_ids = pos_ids.clamp(max=self.config.max_budget)
+        seq = probe_tokens + response_tokens + self.pos_embed(pos_ids)
 
         history_len = obs["history_len"].long().squeeze(-1)
-        max_len = seq.shape[1]
         positions = torch.arange(max_len, device=seq.device).unsqueeze(0)
         padding_mask = positions >= history_len.unsqueeze(1)
         return seq, padding_mask
@@ -151,26 +169,43 @@ class FerretPolicy(nn.Module):
         )
         return self.static_proj(static)
 
-    def forward(self, obs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _encode_sequence(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Run sequence through transformer trunk or MLP ablation; return pooled vector."""
         history_len = obs["history_len"].long().squeeze(-1)
         batch_size = history_len.shape[0]
 
         if (history_len == 0).all():
-            pooled = self.empty_token.reshape(-1).expand(batch_size, -1)
+            return self.empty_token.reshape(-1).expand(batch_size, -1)
+
+        seq, padding_mask = self._embed_history(obs)
+
+        if self.config.use_mlp_trunk:
+            # MLP ablation: mean-pool the valid steps, ignore padding.
+            mask_float = (~padding_mask).float().unsqueeze(-1)  # [B, T, 1]
+            valid_sum = (seq * mask_float).sum(dim=1)
+            valid_count = mask_float.sum(dim=1).clamp(min=1.0)
+            mean_pooled = valid_sum / valid_count  # [B, D]
+            encoded_pooled = self.transformer(mean_pooled)
         else:
-            seq, padding_mask = self._embed_history(obs)
-            # Transformer requires at least one non-masked token per batch row.
+            # Transformer trunk: ensure at least one unmasked token per row.
             no_history = history_len == 0
             if no_history.any():
                 padding_mask = padding_mask.clone()
                 padding_mask[no_history, 0] = False
             encoded = self.transformer(seq, src_key_padding_mask=padding_mask)
-            pooled = self._pool_sequence(encoded, padding_mask, history_len)
-            if no_history.any():
-                empty = self.empty_token.reshape(-1)
-                pooled = pooled.clone()
-                pooled[no_history] = empty
+            encoded_pooled = self._pool_sequence(encoded, padding_mask, history_len)
 
+        # Replace zero-history rows with the learned empty token.
+        no_history = history_len == 0
+        if no_history.any():
+            empty = self.empty_token.reshape(-1).expand(batch_size, -1)
+            encoded_pooled = encoded_pooled.clone()
+            encoded_pooled[no_history] = empty[no_history]
+
+        return encoded_pooled
+
+    def forward(self, obs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        pooled = self._encode_sequence(obs)
         context = torch.cat([pooled, self._static_context(obs)], dim=-1)
         return self.actor(context), self.critic(context)
 
@@ -198,6 +233,14 @@ class FerretAgent(nn.Module):
     def __init__(self, config: PolicyConfig | None = None):
         super().__init__()
         self.policy = FerretPolicy(config)
+
+    @property
+    def config(self) -> PolicyConfig:
+        return self.policy.config
+
+    def get_value(self, obs: dict[str, np.ndarray | torch.Tensor]) -> torch.Tensor:
+        device = next(self.parameters()).device
+        return self.policy.get_value(_to_tensor(obs, device))
 
     def get_action_and_value(
         self,

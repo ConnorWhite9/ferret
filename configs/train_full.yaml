@@ -1,0 +1,47 @@
+# Full attack mix config — FGSM + PGD-20 + CW
+# Requires precomputed adversarial cache (run `make cache` first).
+# Longer training: 1M steps recommended.
+
+exp_name: ferret_full
+seed: 42
+cuda: true
+torch_deterministic: true
+
+# PPO
+total_timesteps: 1000000
+learning_rate: 0.00025
+num_envs: 4
+num_steps: 128
+anneal_lr: true
+gamma: 0.99
+gae_lambda: 0.95
+num_minibatches: 4
+update_epochs: 4
+norm_adv: true
+clip_coef: 0.2
+clip_vloss: true
+ent_coef: 0.01
+vf_coef: 0.5
+max_grad_norm: 0.5
+
+# MORL / data
+adversarial_ratio: 0.5
+attack_types: ["fgsm", "pgd", "cw"]
+precompute_adversarial: true
+dataset: imagenette
+download_data: true
+max_budget: 10
+lambda_anneal: true
+lambda_start: 0.01
+lambda_end: 0.05
+
+# Checkpointing
+checkpoint_every: 50
+
+# Val eval during training
+eval_every: 100
+eval_episodes: 100
+
+# Tracking
+track: true
+wandb_project_name: ferret

@@ -41,6 +41,7 @@ def run_poc_episode(
     image: torch.Tensor,
     label: int,
     target_model: VisionEncoder,
+    clean_image: torch.Tensor | None = None,
     max_budget: int = MAX_BUDGET,
 ) -> PocResult:
     from agents.probe_executor import ProbeExecutor
@@ -49,7 +50,10 @@ def run_poc_episode(
     confidence = ConfidenceAggregator()
     decision_node = DecisionNode()
 
-    baseline = target_model.logits(image).squeeze(0).detach().cpu()
+    # Baseline must be the CLEAN image prediction so adversarial probes diverge
+    # upward from it and clean probes stay close — giving the correct signal direction.
+    reference = clean_image if clean_image is not None else image
+    baseline = target_model.logits(reference).squeeze(0).detach().cpu()
     confidence.reset(baseline)
 
     working = image.clone()
@@ -100,7 +104,7 @@ def main() -> None:
 
     for _ in range(args.episodes):
         sample = pipeline.sample_episode("val")
-        result = run_poc_episode(sample.image, sample.label, encoder)
+        result = run_poc_episode(sample.image, sample.label, encoder, clean_image=sample.clean_image)
         if sample.is_adversarial:
             adv_scores.append(result.final_confidence)
         else:

@@ -128,9 +128,14 @@ class FerretVisionEnv(gym.Env):
             self._rng = np.random.default_rng(seed)
 
         sample = self.data_pipeline.sample_episode(self.split)  # type: ignore[arg-type]
-        logits, features = self.target_model(sample.image)
-        baseline_logits = logits.squeeze(0).detach().cpu()
+        # Always compute embedding from the episode image (adversarial or clean).
+        _, features = self.target_model(sample.image)
         input_embedding = features.squeeze(0).detach().cpu()
+        # Baseline logits MUST come from the clean image so the confidence score
+        # measures divergence from clean-model behaviour, not from an adversarial
+        # baseline (which would invert the signal — clean shifts > adversarial shifts).
+        clean_logits, _ = self.target_model(sample.clean_image)
+        baseline_logits = clean_logits.squeeze(0).detach().cpu()
         preference = sample_preference_vector(self._rng)
 
         self._episode = EpisodeState(

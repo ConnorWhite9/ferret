@@ -1,0 +1,11 @@
+# Default eval config — override checkpoint on CLI
+# Usage: python -m eval.benchmark --checkpoint runs/.../policy.pt
+
+episodes: 200
+fit_episodes: 100
+split: val
+adversarial_ratio: 0.5
+attack_types: ["fgsm"]
+seed: 42
+plot: true
+no_baselines: false

@@ -9,3 +9,6 @@ tyro
 tensorboard
 langgraph>=0.2
 wandb>=0.16
+matplotlib
+scikit-learn
+pyyaml

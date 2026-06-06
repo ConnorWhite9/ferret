@@ -26,7 +26,9 @@ class DataConfig:
     cache_root: Path = field(default_factory=lambda: Path("data/cache"))
     image_size: int = 224
     batch_size: int = 32
-    num_workers: int = 4
+    # Default 0 for macOS / sandbox safety (shared memory manager restriction).
+    # Set to 4+ on Linux/GPU machines for throughput.
+    num_workers: int = 0
     pin_memory: bool = True
 
     # Episode sampling: probability an episode starts from an adversarial input.

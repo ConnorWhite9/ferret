@@ -23,6 +23,7 @@ from ferret.constants import MAX_BUDGET, NUM_PROBE_ACTIONS
 from policy.trunk import FerretAgent, PolicyConfig
 from policy.vision_encoder import VisionEncoder
 from reward.morl_reward import LambdaSchedule, MORLReward, RewardNormalizer
+from train.checkpoint import load_checkpoint, save_checkpoint
 from train.morl_logging import extract_episode_metrics, extract_reward_vectors, log_morl_metrics
 from train.morl_scalarization import PreferenceConditionedScalarization
 
@@ -65,6 +66,14 @@ class Args:
     lambda_anneal: bool = True
     lambda_start: float = 0.01
     lambda_end: float = 0.05
+
+    # Resume / checkpointing
+    resume: str | None = None
+    checkpoint_every: int = 50  # save every N updates
+
+    # Periodic val eval during training
+    eval_every: int = 0   # 0 = disabled; >0 = eval every N updates
+    eval_episodes: int = 50
 
 
 def _alloc_obs_buffer(
@@ -129,8 +138,9 @@ def train(args: Args) -> None:
         adversarial_ratio=args.adversarial_ratio,
         attack_types=args.attack_types,  # type: ignore[arg-type]
         precompute_adversarial=args.precompute_adversarial,
-        batch_size=args.batch_size,
         download=args.download_data,
+        # macOS/fork safety: DataLoader workers must be 0 when spawned from SyncVectorEnv
+        num_workers=0,
     )
     target_model = VisionEncoder(device=device)
     pipeline = FerretDataPipeline(
@@ -141,8 +151,10 @@ def train(args: Args) -> None:
     if data_config.adversarial_ratio > 0.0 and data_config.precompute_adversarial:
         print("Precomputing adversarial cache (may take a while on first run)...")
         pipeline.ensure_adversarial_cache("train")
+        if args.eval_every > 0:
+            pipeline.ensure_adversarial_cache("val")
 
-    morl = PreferenceConditionedScalarization(reward_normalizer=RewardNormalizer())
+    morl = PreferenceConditionedScalarization(normalizer=RewardNormalizer())
     shared_reward = MORLReward(max_budget=args.max_budget, lambda_eff=args.lambda_start)
     lambda_schedule = LambdaSchedule(start=args.lambda_start, end=args.lambda_end)
 
@@ -167,6 +179,16 @@ def train(args: Args) -> None:
     agent = FerretAgent(PolicyConfig(max_budget=args.max_budget)).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
+    start_global_step = 0
+    start_update = 1
+    if args.resume:
+        resume_path = Path(args.resume)
+        print(f"Resuming from {resume_path}")
+        start_global_step, resume_update, _ = load_checkpoint(
+            resume_path, agent, optimizer, device=device
+        )
+        start_update = resume_update + 1
+
     obs_buffer = _alloc_obs_buffer(envs.single_observation_space, args.num_steps, args.num_envs)
     actions = np.zeros((args.num_steps, args.num_envs), dtype=np.int64)
     logprobs = np.zeros((args.num_steps, args.num_envs), dtype=np.float32)
@@ -175,15 +197,18 @@ def train(args: Args) -> None:
     values = np.zeros((args.num_steps, args.num_envs), dtype=np.float32)
     reward_vectors = np.zeros((args.num_steps, args.num_envs, 4), dtype=np.float32)
 
-    global_step = 0
+    global_step = start_global_step
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
     next_done = np.zeros(args.num_envs, dtype=np.float32)
 
+    checkpoint_dir = Path(f"runs/{run_name}")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     num_updates = args.total_timesteps // args.batch_size
     episode_metrics_accum: dict[str, list[float]] = {}
 
-    for update in range(1, num_updates + 1):
+    for update in range(start_update, num_updates + 1):
         progress = (update - 1.0) / max(num_updates - 1, 1)
         if args.anneal_lr:
             frac = 1.0 - progress
@@ -211,8 +236,10 @@ def train(args: Args) -> None:
 
             reward_vectors[step] = extract_reward_vectors(infos, args.num_envs)
             step_metrics = extract_episode_metrics(infos, args.num_envs)
-            for key, values in step_metrics.items():
-                finite = values[np.isfinite(values)]
+            # NOTE: loop var intentionally named ep_vals to avoid shadowing the
+            # critic `values` buffer defined above.
+            for key, ep_vals in step_metrics.items():
+                finite = ep_vals[np.isfinite(ep_vals)]
                 if finite.size > 0:
                     episode_metrics_accum.setdefault(key, []).extend(finite.tolist())
 
@@ -332,16 +359,68 @@ def train(args: Args) -> None:
             f"SPS={int(global_step / (time.time() - start_time))}"
         )
 
+        # Periodic checkpoint
+        if args.checkpoint_every > 0 and update % args.checkpoint_every == 0:
+            ckpt_path = checkpoint_dir / f"policy_step{global_step}.pt"
+            save_checkpoint(ckpt_path, agent, optimizer, args, global_step, update)
+
+        # Periodic val eval
+        if args.eval_every > 0 and update % args.eval_every == 0:
+            _run_val_eval(agent, target_model, pipeline, args, device, writer, global_step)
+
     envs.close()
     writer.close()
 
-    checkpoint_dir = Path(f"runs/{run_name}")
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    torch.save({"agent": agent.state_dict()}, checkpoint_dir / "policy.pt")
-    print(f"Saved policy checkpoint to {checkpoint_dir / 'policy.pt'}")
+    save_checkpoint(checkpoint_dir / "policy.pt", agent, optimizer, args, global_step, update)
+    print(f"Saved final checkpoint to {checkpoint_dir / 'policy.pt'}")
 
     if args.track:
         wandb.finish()
+
+
+def _run_val_eval(
+    agent: FerretAgent,
+    encoder: VisionEncoder,
+    pipeline: FerretDataPipeline,
+    args: Args,
+    device: torch.device,
+    writer: SummaryWriter,
+    global_step: int,
+) -> None:
+    from eval.metrics import EpisodeRecord, compute_metrics
+    from graph import FerretDetector
+
+    agent.eval()
+    detector = FerretDetector.from_models(encoder, agent, deterministic_policy=True)
+    records: list[EpisodeRecord] = []
+    for _ in range(args.eval_episodes):
+        try:
+            sample = pipeline.sample_episode("val")  # type: ignore[arg-type]
+            outcome = detector.detect(sample.image, label=sample.label)
+            records.append(
+                EpisodeRecord(
+                    confidence=outcome.confidence,
+                    flagged=outcome.flagged,
+                    is_adversarial=bool(sample.is_adversarial),
+                    probes_used=outcome.probes_used,
+                    attack_type=sample.attack_type,
+                )
+            )
+        except Exception:
+            continue
+    agent.train()
+
+    if not records:
+        return
+    m = compute_metrics("val", records)
+    writer.add_scalar("eval/accuracy", m.accuracy, global_step)
+    writer.add_scalar("eval/roc_auc", m.roc_auc, global_step)
+    writer.add_scalar("eval/fpr_at_tpr95", m.fpr_at_tpr95, global_step)
+    writer.add_scalar("eval/mean_probes", m.mean_probes, global_step)
+    print(
+        f"[val] accuracy={m.accuracy:.3f} roc_auc={m.roc_auc:.3f} "
+        f"fpr95={m.fpr_at_tpr95:.3f} probes={m.mean_probes:.2f}"
+    )
 
 
 def _target_model_for_foolbox(encoder: VisionEncoder) -> torch.nn.Module:
@@ -354,7 +433,8 @@ def _target_model_for_foolbox(encoder: VisionEncoder) -> torch.nn.Module:
             self.encoder = vision_encoder
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return self.encoder.logits(x)
+            # Must use logits_with_grad so foolbox can backpropagate for FGSM/PGD.
+            return self.encoder.logits_with_grad(x)
 
     return _Wrapper(encoder)
 

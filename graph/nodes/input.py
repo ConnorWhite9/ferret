@@ -44,9 +44,14 @@ def input_node(state: FerretState, deps: FerretGraphDeps | None = None, config: 
             raise ValueError("preference must be a 4-d vector.")
 
     label = state.get("label")
-    logits, features = deps.target_model(image)
-    baseline_logits = logits.squeeze(0).detach().cpu()
+    # Input embedding always comes from the episode image (may be adversarial).
+    _, features = deps.target_model(image)
     input_embedding = features.squeeze(0).detach().cpu()
+
+    # Baseline logits MUST come from the clean image so the confidence aggregator
+    # measures divergence from clean-model behaviour — same fix as FerretVisionEnv.
+    clean_logits, _ = deps.target_model(clean_image)
+    baseline_logits = clean_logits.squeeze(0).detach().cpu()
 
     episode = EpisodeState(
         image=image,

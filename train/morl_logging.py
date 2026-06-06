@@ -70,7 +70,8 @@ def log_morl_metrics(
     episode_metrics: dict[str, np.ndarray] | None = None,
 ) -> None:
     """Write per-objective TensorBoard scalars."""
-    means = reward_vectors.mean(axis=0)
+    # reward_vectors may be (T, N, 4) or (N, 4) — flatten to (4,)
+    means = reward_vectors.reshape(-1, len(MORL_OBJECTIVE_NAMES)).mean(axis=0)
     for idx, name in enumerate(MORL_OBJECTIVE_NAMES):
         writer.add_scalar(f"morl/{name}", float(means[idx]), global_step)
 
